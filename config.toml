@@ -1,0 +1,29 @@
+[project]
+user_env = []
+session_timeout = 3600
+allow_origins = ["*"]
+
+[features]
+unsafe_allow_html = false
+latex = false
+user_message_markdown = true
+
+[features.spontaneous_file_upload]
+    enabled = false
+    accept = ["image/jpeg", "image/png"]
+    max_files = 1
+    max_size_mb = 10
+
+[features.audio]
+    enabled = false
+    sample_rate = 24000
+
+[features.mcp]
+    enabled = false
+
+[UI]
+name = "HR Analytics"
+cot = "hidden"
+
+[meta]
+generated_by = "2.11.1"

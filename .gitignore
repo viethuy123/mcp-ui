@@ -1,0 +1,11 @@
+*env
+*pycache*
+*.pyc
+*.pyo
+*.pyd   
+__pycache__/
+*.so
+*.dylib
+*.files
+*.log
+*.chainlit

@@ -1,0 +1,26 @@
+services:
+  chainlit-ui:
+    build: .
+    container_name: hr-chatui
+    ports:
+      - "8089:8080"
+    env_file: .env
+    environment:
+      - CHAINLIT_URL=http://localhost:8089
+      - MCP_URL=http://postgres-hr-mcp:8000/mcp
+      - CHAINLIT_AUTH_SECRET=changeme_random_secret_123
+      - CHAINLIT_TELEMETRY=false
+      - OPENAI_MODEL=gpt-4.1-mini
+      - LITERAL_API_KEY=
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  dev-network:
+    external: true
