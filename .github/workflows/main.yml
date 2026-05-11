@@ -1,0 +1,64 @@
+name: Deploy MCP UI
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: SSH and Smart Deploy MCP UI
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 7001
+          script: |
+            set -e
+            cd /home/user/warehouse/mcp-ui
+
+            # Đảm bảo Git nhận diện thư mục an toàn
+            git config --global --add safe.directory $(pwd)
+
+            # Lấy SHA hiện tại trước khi pull
+            BEFORE_SHA=$(git rev-parse HEAD)
+
+            # Pull code mới
+            git pull origin main
+
+            # Lấy SHA sau khi pull
+            AFTER_SHA=$(git rev-parse HEAD)
+
+            echo "🔍 Checking changes: $BEFORE_SHA → $AFTER_SHA"
+
+            # Không có thay đổi → bỏ qua
+            if [ "$BEFORE_SHA" = "$AFTER_SHA" ]; then
+              echo "ℹ️ No changes detected, skipping deployment"
+              exit 0
+            fi
+
+            # Kiểm tra có thay đổi liên quan Docker/dependency không
+            DOCKER_CHANGED=$(git diff --name-only $BEFORE_SHA $AFTER_SHA \
+              | grep -qE "(Dockerfile|docker-compose\.ya?ml|\.dockerignore|requirements\.txt|package\.json|package-lock\.json|yarn\.lock)" \
+              && echo "yes" || echo "no")
+
+            if [ "$DOCKER_CHANGED" = "yes" ]; then
+              echo "🔨 Docker/dependency files changed - Rebuilding containers..."
+              docker compose down
+              docker compose up -d --build
+            else
+              echo "📝 Only source code changed - Pulling is enough, restarting containers..."
+              docker compose restart
+            fi
+
+            # Dọn image cũ
+            docker image prune -f
+
+            echo "✅ MCP UI deployment completed!"
