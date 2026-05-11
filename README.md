@@ -1,86 +1,71 @@
 # HR Analytics UI (Chainlit + MCP)
 
-Ứng dụng chat UI cho bài toán HR Analytics, dùng `Chainlit` làm giao diện và gọi `MCP server` để truy vấn dữ liệu nhân sự qua tools.
+Ung dung chat UI cho bai toan HR Analytics, dung Chainlit lam giao dien va goi MCP server de truy van du lieu nhan su.
 
-## Tính năng chính
-- Chat tiếng Việt cho nghiệp vụ HR Analytics.
-- Tự động lấy danh sách MCP tools khi bắt đầu phiên chat.
-- Gọi tool qua OpenAI function-calling để:
-  - truy vấn metric có sẵn,
-  - khám phá schema,
-  - chạy truy vấn dữ liệu.
-- Có thể chạy local hoặc bằng Docker.
+## Tinh nang chinh
+- Chat tieng Viet cho nghiep vu HR Analytics.
+- Tu dong lay danh sach MCP tools khi bat dau phien chat.
+- Goi tool qua function-calling de truy van metric, schema va du lieu.
+- Co the chay local hoac bang Docker.
 
-## Công nghệ sử dụng
+## Cong nghe su dung
 - Python `3.11`
 - `chainlit==2.11.1`
-- `openai>=1.0.0`
+- `openai>=1.0.0` (dung client OpenAI-compatible cho Gemini)
 - `httpx`, `pydantic`
 
-## Cấu trúc chính
-- `app.py`: logic chat, gọi OpenAI, gọi MCP tools.
-- `config.toml`: cấu hình Chainlit UI/feature.
-- `chainlit.md`: nội dung chào mừng trên UI.
-- `Dockerfile`: build image chạy app.
-- `docker-compose.yml`: chạy app với cấu hình môi trường.
-
-## Cấu hình môi trường
-Tạo file `.env` từ mẫu:
+## Cau hinh moi truong
+Tao file `.env` tu mau:
 
 ```bash
 cp .env.example .env
 ```
 
-Thiết lập các biến bắt buộc trong `.env`:
+Thiet lap cac bien bat buoc:
 
 ```env
-OPENAI_API_KEY=your_openai_api_key
-OPENAI_MODEL=gpt-4.1-mini
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-2.0-flash
 MCP_URL=http://localhost:8000/mcp
 ```
 
-Ghi chú:
-- App dùng `OPENAI_API_KEY` (hoặc fallback `GPT_API_KEY`).
-- `MCP_URL` phải trỏ đúng endpoint SSE của MCP server.
+Tuy chon:
 
-## Chạy local
-1. Cài dependency:
+```env
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+```
+
+## Chay local
+1. Cai dependency:
 ```bash
 pip install -r requirements.txt
 ```
-2. Chạy app:
+2. Chay app:
 ```bash
 python -m chainlit run app.py --host 0.0.0.0 --port 8080 --headless
 ```
-3. Mở trình duyệt tại:
+3. Mo trinh duyet:
 - `http://localhost:8080`
 
-## Chạy bằng Docker Compose
-1. Đảm bảo đã có file `.env`.
-2. Nếu dùng network ngoài như trong `docker-compose.yml`, tạo network trước:
+## Chay bang Docker Compose
+1. Dam bao da co file `.env`.
+2. Tao network neu can:
 ```bash
 docker network create dev-network
 ```
-3. Chạy:
+3. Chay:
 ```bash
 docker compose up -d --build
 ```
-4. Truy cập:
+4. Truy cap:
 - `http://localhost:8089`
 
-## Healthcheck
-- Container kiểm tra endpoint `/` nội bộ tại cổng `8080`.
+## Loi thuong gap
+- Thieu key:
+  - UI bao thieu `GEMINI_API_KEY`.
+- Khong ket noi duoc MCP:
+  - Kiem tra `MCP_URL`, container MCP, va Docker network.
 
-## Lỗi thường gặp
-- Thiếu API key:
-  - UI báo thiếu `OPENAI_API_KEY`/`GPT_API_KEY`.
-- Không kết nối được MCP:
-  - Kiểm tra `MCP_URL`.
-  - Kiểm tra container MCP và Docker network.
-- Không load được tools khi vào chat:
-  - App vẫn chat được, nhưng không gọi được tool dữ liệu.
-
-## Bảo mật
-- Không commit file `.env` chứa secret.
-- Nên thay `CHAINLIT_AUTH_SECRET` trong `docker-compose.yml` bằng giá trị mạnh hơn khi deploy.
-
+## Bao mat
+- Khong commit `.env`.
+- Thay `CHAINLIT_AUTH_SECRET` bang gia tri manh hon khi deploy.

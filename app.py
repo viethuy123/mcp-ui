@@ -1,102 +1,241 @@
-import os
+import asyncio
 import json
-import httpx
+import os
+from urllib.parse import urljoin
+
 import chainlit as cl
+import httpx
 from openai import AsyncOpenAI
+
 os.environ["CHAINLIT_TELEMETRY"] = "false"
+
 MCP_BASE = os.getenv("MCP_URL", "http://postgres-hr-mcp:8000/mcp")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("GPT_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip('"')
+GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_DISABLED_MODELS = os.getenv("GEMINI_DISABLED_MODELS", "")
+MCP_DEBUG = os.getenv("MCP_DEBUG", "false").lower() == "true"
+GEMINI_BASE_URL = os.getenv(
+    "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+)
 
-# ─── MCP SSE Transport ───────────────────────────────────────────────────────
+def build_api_key_candidates() -> list[str]:
+    keys = [k.strip().strip('"') for k in GEMINI_API_KEYS.split(",") if k.strip()]
+    if GEMINI_API_KEY and GEMINI_API_KEY not in keys:
+        keys.insert(0, GEMINI_API_KEY)
+    return keys
 
-async def mcp_request(method: str, params: dict = None) -> dict:
+
+API_KEY_CANDIDATES = build_api_key_candidates()
+llm_clients = [
+    AsyncOpenAI(api_key=api_key, base_url=GEMINI_BASE_URL) for api_key in API_KEY_CANDIDATES
+]
+
+
+def is_quota_or_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    keywords = ["429", "quota", "rate limit", "resource_exhausted", "too many requests"]
+    return any(k in text for k in keywords)
+
+
+def is_model_invalid_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    keywords = [
+        "400",
+        "bad request",
+        "invalid model",
+        "model not found",
+        "unsupported model",
+    ]
+    return any(k in text for k in keywords)
+
+
+async def create_chat_completion_with_fallback(messages: list, tools: list | None):
+    last_error = None
+    attempted_keys = []
+    if GEMINI_MODEL in {m.strip() for m in GEMINI_DISABLED_MODELS.split(",") if m.strip()}:
+        raise RuntimeError(f"Model `{GEMINI_MODEL}` dang bi disable boi GEMINI_DISABLED_MODELS.")
+
+    for i, client in enumerate(llm_clients):
+        attempted_keys.append(f"key_{i+1}")
+        try:
+            resp = await client.chat.completions.create(
+                model=GEMINI_MODEL,
+                messages=messages,
+                tools=tools if tools else None,
+                tool_choice="auto" if tools else None,
+            )
+            return resp, GEMINI_MODEL, f"key_{i+1}"
+        except Exception as e:
+            last_error = e
+            if is_quota_or_rate_limit_error(e):
+                if MCP_DEBUG:
+                    print(f"[LLM] key_{i+1} quota/rate limited, trying next key...")
+                continue
+            if MCP_DEBUG:
+                print(f"[LLM] key_{i+1} failed with non-retryable error: {e}")
+                raise
+    if last_error:
+        raise RuntimeError(
+            f"Khong goi duoc model `{GEMINI_MODEL}` voi cac key ({', '.join(attempted_keys)}). Loi cuoi: {last_error}"
+        )
+    raise RuntimeError("Khong goi duoc Gemini model")
+
+
+async def mcp_request(method: str, params: dict | None = None) -> dict:
     sse_url = MCP_BASE
-    messages_url = MCP_BASE.rstrip("/") + "/messages"
+    messages_url = MCP_BASE.rstrip("/") + "/messages/"
     payload = {
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": 2,
         "method": method,
-        "params": params or {},
     }
+    # Some MCP servers reject empty `params` for methods like `tools/list`.
+    if params is not None:
+        payload["params"] = params
 
     result_data = None
+    initialize_done = False
     session_id = None
+    endpoint_url = None
     event_type = ""
+
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             async with client.stream("GET", sse_url, headers={"Accept": "text/event-stream"}) as sse:
-                async for raw_line in sse.aiter_lines():
-                    line = raw_line.strip()
-                    if not line:
-                        event_type = ""
-                        continue
-                    print(f"DEBUG: {line}")
-                    if line.startswith("event:") and "sessionId=" in line:
-                        parts = line.split("sessionId=")
-                        if len(parts) > 1:
-                            session_id = parts[1].split("&")[0].strip()
-                        event_type = line[6:].strip()
-                    elif line.startswith("data:"):
-                        data_str = line[5:].strip()
+                if MCP_DEBUG:
+                    print(f"[MCP] Connected SSE: {sse_url}")
+                try:
+                    async for raw_line in sse.aiter_lines():
+                        line = raw_line.strip()
+                        if not line:
+                            event_type = ""
+                            continue
 
-                        if event_type == "endpoint":
-                            if "sessionId=" in data_str:
-                                session_id = data_str.split("sessionId=")[-1].split("&")[0].strip()
-                            if session_id:
-                                post_resp = await client.post(
-                                    messages_url,
-                                    json=payload,
-                                    params={"sessionId": session_id},
-                                    headers={"Content-Type": "application/json"},
-                                )
-                                post_resp.raise_for_status()
+                        if MCP_DEBUG:
+                            print(f"[MCP] line: {line}")
 
-                        elif event_type == "message":
-                            try:
-                                msg = json.loads(data_str)
-                                if "result" in msg or "error" in msg:
-                                    result_data = msg
-                                    break
-                            except json.JSONDecodeError:
-                                pass
-                        else:
-                            try:
-                                msg = json.loads(data_str)
-                                if "result" in msg or "error" in msg:
-                                    result_data = msg
-                                    break
-                            except Exception:
-                                pass
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
 
-                    if result_data:
-                        break
+                            if event_type == "endpoint":
+                                endpoint_url = None
+                                if data_str.startswith("http://") or data_str.startswith("https://"):
+                                    endpoint_url = data_str
+                                elif data_str.startswith("/"):
+                                    endpoint_url = urljoin(sse_url, data_str)
+
+                                # Support both `sessionId` and `session_id` styles.
+                                if "sessionId=" in data_str:
+                                    session_id = data_str.split("sessionId=")[-1].split("&")[0].strip()
+                                elif "session_id=" in data_str:
+                                    session_id = data_str.split("session_id=")[-1].split("&")[0].strip()
+                                post_url = None
+                                post_params = None
+
+                                if endpoint_url:
+                                    post_url = endpoint_url
+                                elif session_id:
+                                    post_url = messages_url
+                                    # Prefer session_id because this MCP server uses snake_case.
+                                    post_params = {"session_id": session_id}
+
+                                if post_url:
+                                    if MCP_DEBUG:
+                                        print(f"[MCP] POST {post_url} params={post_params} method={method}")
+                                    if not initialize_done:
+                                        init_payload = {
+                                            "jsonrpc": "2.0",
+                                            "id": 1,
+                                            "method": "initialize",
+                                            "params": {
+                                                "protocolVersion": "2024-11-05",
+                                                "capabilities": {},
+                                                "clientInfo": {"name": "chainlit-ui", "version": "1.0.0"},
+                                            },
+                                        }
+                                        init_resp = await client.post(
+                                            post_url,
+                                            json=init_payload,
+                                            params=post_params,
+                                            headers={"Content-Type": "application/json"},
+                                        )
+                                        if MCP_DEBUG:
+                                            print(f"[MCP] INIT status: {init_resp.status_code}")
+                                        init_resp.raise_for_status()
+
+                                        initialized_notify = {
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/initialized",
+                                            "params": {},
+                                        }
+                                        notify_resp = await client.post(
+                                            post_url,
+                                            json=initialized_notify,
+                                            params=post_params,
+                                            headers={"Content-Type": "application/json"},
+                                        )
+                                        if MCP_DEBUG:
+                                            print(f"[MCP] NOTIFY status: {notify_resp.status_code}")
+                                        notify_resp.raise_for_status()
+                                        initialize_done = True
+
+                                    post_resp = await client.post(
+                                        post_url,
+                                        json=payload,
+                                        params=post_params,
+                                        headers={"Content-Type": "application/json"},
+                                    )
+                                    if MCP_DEBUG:
+                                        print(f"[MCP] POST status: {post_resp.status_code}")
+                                    post_resp.raise_for_status()
+                                elif MCP_DEBUG:
+                                    print("[MCP] endpoint event but missing endpoint_url/sessionId")
+                            else:
+                                try:
+                                    msg = json.loads(data_str)
+                                    # Ignore initialize response and only return the target request response id=2.
+                                    if msg.get("id") == 2 and ("result" in msg or "error" in msg):
+                                        result_data = msg
+                                        break
+                                except json.JSONDecodeError:
+                                    pass
+
+                        if result_data:
+                            break
+                except (GeneratorExit, RuntimeError):
+                    # Avoid noisy httpcore warning when outer timeout/cancel closes the SSE stream.
+                    if MCP_DEBUG:
+                        print("[MCP] SSE stream closed.")
     except httpx.ConnectError:
-        raise RuntimeError(f"Không thể kết nối tới MCP tại {sse_url}. Kiểm tra Docker Network!")
+        raise RuntimeError(f"Khong the ket noi toi MCP tai {sse_url}. Kiem tra network.")
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"Timeout khi goi MCP tai {sse_url}.")
     except Exception as e:
-        raise RuntimeError(f"Lỗi MCP không xác định: {str(e)}")
-                        
+        raise RuntimeError(f"Loi MCP: {e}")
+
     if result_data is None:
-        raise RuntimeError("MCP server không trả về response")
+        raise RuntimeError("MCP server khong tra ve response")
     if "error" in result_data:
         raise RuntimeError(result_data["error"].get("message", "MCP error"))
+
     return result_data.get("result", {})
 
 
 async def list_mcp_tools() -> list[dict]:
-    result = await mcp_request("tools/list")
+    # Many MCP servers require an explicit empty params object for tools/list.
+    result = await mcp_request("tools/list", {})
     return result.get("tools", [])
 
 
 async def call_mcp_tool(name: str, arguments: dict) -> str:
     result = await mcp_request("tools/call", {"name": name, "arguments": arguments})
     content = result.get("content", [])
-    parts = [block["text"] for block in content if block.get("type") == "text"]
-    return "\n".join(parts) if parts else json.dumps(result)
+    parts = [block.get("text", "") for block in content if block.get("type") == "text"]
+    return "\n".join(parts) if parts else json.dumps(result, ensure_ascii=False)
 
-
-# ─── Gemini tool schema ──────────────────────────────────────────────────────
 
 def mcp_tool_to_openai(tool: dict) -> dict:
     input_schema = tool.get("inputSchema") or tool.get("input_schema") or {}
@@ -116,22 +255,17 @@ def mcp_tool_to_openai(tool: dict) -> dict:
     }
 
 
-# ─── Chainlit ────────────────────────────────────────────────────────────────
-
-import asyncio
-
 @cl.on_chat_start
 async def on_chat_start():
     try:
-        # Giới hạn chờ MCP trong 5 giây, nếu lâu hơn sẽ văng lỗi Timeout
-        tools = await asyncio.wait_for(list_mcp_tools(), timeout=5.0)
+        tools = await list_mcp_tools()
         cl.user_session.set("mcp_tools", tools)
-        
         tool_names = ", ".join(t["name"] for t in tools) if tools else "None"
-        await cl.Message(content=f"✅ Kết nối MCP thành công. Tools: `{tool_names}`").send()
+        await cl.Message(content=f"Ket noi MCP thanh cong. Tools: `{tool_names}`").send()
     except Exception as e:
-        # Nếu lỗi hoặc quá 5s, vẫn cho user chat nhưng không có tools
-        await cl.Message(content=f"⚠️ Cảnh báo: Không load được Tools ({e}). Bạn vẫn có thể chat bình thường.").send()
+        await cl.Message(
+            content=f"Canh bao: Khong load duoc tools ({type(e).__name__}: {e}). Van co the chat thuong."
+        ).send()
         cl.user_session.set("mcp_tools", [])
 
 
@@ -140,18 +274,18 @@ async def on_message(message: cl.Message):
     mcp_tools: list = cl.user_session.get("mcp_tools", [])
     history: list = cl.user_session.get("history", [])
 
-    if not openai_client:
-        await cl.Message(content="❌ Thiếu `OPENAI_API_KEY` (hoặc `GPT_API_KEY`). Vui lòng cấu hình trong `.env`.").send()
+    if not llm_clients:
+        await cl.Message(content="Thieu `GEMINI_API_KEY` hoac `GEMINI_API_KEYS`. Vui long cau hinh trong `.env`.").send()
         return
 
     openai_tools = [mcp_tool_to_openai(t) for t in mcp_tools] if mcp_tools else []
 
     system_instruction = (
-        "Bạn là trợ lý HR Analytics thông minh. "
-        "Khi user hỏi về dữ liệu nhân sự, sử dụng tools để truy vấn database. "
-        "Ưu tiên: metric đã biết (headcount, attrition, new_hire, absent_days, tenure) "
-        "→ dùng run_metric_query. Câu hỏi tự do → list_tables → describe_table → run_query. "
-        "Trả lời tiếng Việt, rõ ràng. Dữ liệu dạng bảng → dùng markdown table."
+        "Ban la tro ly HR Analytics thong minh. "
+        "Khi user hoi ve du lieu nhan su, su dung tools de truy van database. "
+        "Uu tien metric da biet (headcount, attrition, new_hire, absent_days, tenure) "
+        "-> dung run_metric_query. Cau hoi tu do -> list_tables -> describe_table -> run_query. "
+        "Tra loi tieng Viet, ro rang. Du lieu dang bang -> dung markdown table."
     )
 
     messages = [{"role": "system", "content": system_instruction}]
@@ -160,18 +294,18 @@ async def on_message(message: cl.Message):
         messages.append({"role": role, "content": h["content"]})
     messages.append({"role": "user", "content": message.content})
 
-    thinking_msg = cl.Message(content="⏳ Đang xử lý...")
+    thinking_msg = cl.Message(content="Dang xu ly...")
     await thinking_msg.send()
 
     try:
         final_text = ""
+
         for _ in range(8):
-            resp = await openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                tools=openai_tools if openai_tools else None,
-                tool_choice="auto" if openai_tools else None,
-            )
+            resp, used_model, used_key = await create_chat_completion_with_fallback(messages, openai_tools)
+            cl.user_session.set("last_used_model", used_model)
+            cl.user_session.set("last_used_key", used_key)
+            if MCP_DEBUG:
+                print(f"[LLM] Using model: {used_model} ({used_key})")
 
             choice = resp.choices[0]
             assistant_msg = choice.message
@@ -193,7 +327,7 @@ async def on_message(message: cl.Message):
                     except json.JSONDecodeError:
                         tool_args = {}
 
-                    thinking_msg.content += f"\n🔧 `{tool_name}`..."
+                    thinking_msg.content += f"\nDang goi tool `{tool_name}`..."
                     await thinking_msg.update()
 
                     try:
@@ -212,12 +346,14 @@ async def on_message(message: cl.Message):
 
             final_text = assistant_msg.content or ""
             if not final_text:
-                final_text = "Xin lỗi, không lấy được kết quả. Vui lòng thử lại."
+                final_text = "Xin loi, khong lay duoc ket qua. Vui long thu lai."
             break
         else:
-            final_text = "Xin lỗi, quá nhiều bước gọi tool. Vui lòng thử lại với câu hỏi ngắn hơn."
+            final_text = "Xin loi, qua nhieu buoc goi tool. Vui long thu lai voi cau hoi ngan hon."
 
-        thinking_msg.content = final_text
+        last_used_model = cl.user_session.get("last_used_model", "unknown")
+        last_used_key = cl.user_session.get("last_used_key", "unknown")
+        thinking_msg.content = f"{final_text}\n\n_Model: `{last_used_model}` | API key: `{last_used_key}`_"
         await thinking_msg.update()
 
         history.append({"role": "user", "content": message.content})
@@ -225,5 +361,5 @@ async def on_message(message: cl.Message):
         cl.user_session.set("history", history[-20:])
 
     except Exception as e:
-        thinking_msg.content = f"❌ Lỗi: {e}"
+        thinking_msg.content = f"Loi: {e}"
         await thinking_msg.update()

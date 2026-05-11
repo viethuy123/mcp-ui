@@ -1,2 +1,5 @@
-GEMINI_API_KEY="AIzaSyAJaexf_0HnLC6Fxky435F2aZQyDt8T4bw"
+GEMINI_API_KEY=
+GEMINI_API_KEYS=
+GEMINI_MODEL=gemini-3.1-flash-lite
+MCP_URL=http://103.18.7.212:7005/mcp
 MCP_URL=http://postgres-hr-mcp:8000/mcp
